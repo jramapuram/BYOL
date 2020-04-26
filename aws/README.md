@@ -28,7 +28,7 @@ The following will train a fashion VAE on an AWS spot instance.
     'instance_type': 'p3.2xlarge',
     'instance_zone': None,
     'keypair': 'aws',
-    'log_bucket': 's3://jramapuram-logs',
+    'log_bucket': 's3://MY-LOG-BUCKET',
     'no_background': False,
     'no_terminate': False,
     'number_of_instances': 1,

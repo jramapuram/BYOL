@@ -7,132 +7,75 @@ import torch
 import torchvision
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import torch.multiprocessing as mp
 import numpy as np
 
-from copy import deepcopy
+
 from torchvision import transforms
+import torchvision.models as models
 
 import helpers.metrics as metrics
 import helpers.layers as layers
 import helpers.utils as utils
 import optimizers.scheduler as scheduler
 
-from models.vae import build_vae
 from datasets.loader import get_loader
 from helpers.grapher import Grapher
-from helpers.async_fid.client import FIDClient
 from optimizers.lars import LARS
 
 
-parser = argparse.ArgumentParser(description='')
+# Grab all the model names from torchvision
+model_names = sorted(name for name in models.__dict__
+                     if name.islower() and not name.startswith("__")
+                     and callable(models.__dict__[name]))
+
+
+parser = argparse.ArgumentParser(description='SimCLR Pytorch')
 
 # Task parameters
-parser.add_argument('--task', type=str, default="fashion",
-                    help="""task to work on (can specify multiple) [mnist / cifar10 /
-                    fashion / svhn_centered / svhn / clutter / permuted] (default: mnist)""")
-parser.add_argument('--batch-size', type=int, default=128, metavar='N',
-                    help='input batch size for training (default: 128)')
+parser.add_argument('--task', type=str, default="imagefolder",
+                    help="""task to work on  (default: imagefolder)""")
+parser.add_argument('--batch-size', type=int, default=4096, metavar='N',
+                    help='input batch size for training (default: 4096)')
 parser.add_argument('--epochs', type=int, default=3000, metavar='N',
-                    help='minimum number of epochs to train (default: 1000)')
+                    help='minimum number of epochs to train (default: 3000)')
 parser.add_argument('--download', type=int, default=1,
-                    help='download dataset from s3 (default: 1)')
-parser.add_argument('--image-size-override', type=int, default=None,
+                    help='download simple datasets like MNIST/CIFAR10 (default: 1)')
+parser.add_argument('--image-size-override', type=int, default=224,
                     help='Override and force resizing of images to this specific size (default: None)')
 parser.add_argument('--data-dir', type=str, default='./.datasets', metavar='DD',
                     help='directory which contains input data')
 parser.add_argument('--uid', type=str, default="",
                     help='uid for current session (default: empty-str)')
 
-# VAE related
-parser.add_argument('--vae-type', type=str, default='simple',
-                    help='parallel, sequential, vrnn, simple, msg (default: simple)')
-parser.add_argument('--monte-carlo-posterior-samples', type=int, default=1,
-                    help='number of monte carlo samples to use from posterior (default: 1)')
-parser.add_argument('--nll-type', type=str, default='bernoulli',
-                    help='bernoulli or gaussian (default: bernoulli)')
-parser.add_argument('--reparam-type', type=str, default='isotropic_gaussian',
-                    help='isotropic_gaussian, discrete or mixture [default: isotropic_gaussian]')
-parser.add_argument('--continuous-size', type=int, default=32, metavar='L',
-                    help='latent size of continuous variable when using mixture or gaussian (default: 32)')
-parser.add_argument('--discrete-size', type=int, default=1,
-                    help='initial dim of discrete variable when using mixture or gumbel (default: 1)')
-parser.add_argument('--continuous-mut-info', type=float, default=0.0,
-                    help='-continuous_mut_info * I(z_c; x) is applied (opposite dir of disc)(default: 0.0)')
-parser.add_argument('--discrete-mut-info', type=float, default=0.0,
-                    help='+discrete_mut_info * I(z_d; x) is applied (default: 0.0)')
-parser.add_argument('--generative-scale-var', type=float, default=1.0,
-                    help='scale variance of prior in order to capture outliers')
-parser.add_argument('--use-aggregate-posterior', action='store_true', default=False,
-                    help='uses aggregate posterior for generation (default: False)')
 
-# Model
-parser.add_argument('--encoder-layer-type', type=str, default='conv',
-                    help='dense / resnet / conv (default: conv)')
-parser.add_argument('--decoder-layer-type', type=str, default='conv',
-                    help='dense / conv / coordconv (default: conv)')
-parser.add_argument('--activation', type=str, default='elu',
-                    help='default activation function (default: elu)')
+# Model related
+parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50', choices=model_names,
+                    help='model architecture: ' + ' | '.join(model_names) + ' (default: resnet18)')
+parser.add_argument('--pretrained', action='store_true', default=False,
+                    help='pull pretrained model weights (default: False)')
 parser.add_argument('--weight-initialization', type=str, default=None,
                     help='weight initialization type; None uses default pytorch init. (default: None)')
-parser.add_argument('--latent-size', type=int, default=512, metavar='N',
-                    help='sizing for latent layers (default: 512)')
-parser.add_argument('--encoder-base-channels', type=int, default=32,
-                    help='number of initial conv filter maps (default: 32)')
-parser.add_argument('--encoder-channel-multiplier', type=int, default=2,
-                    help='grow channels by this per layer (default: 2)')
-parser.add_argument('--decoder-base-channels', type=int, default=1024,
-                    help='number of initial conv filter maps (default: 1024)')
-parser.add_argument('--decoder-channel-multiplier', type=float, default=0.5,
-                    help='shrinks channels by this per layer (default: 0.5)')
-parser.add_argument('--disable-gated', action='store_true', default=False,
-                    help='disables gated convolutional or dense structure (default: False)')
 parser.add_argument('--model-dir', type=str, default='.models',
                     help='directory which contains saved models (default: .models)')
 
-# RNN Related
-parser.add_argument('--clip', type=float, default=0,
-                    help='gradient clipping for RNN (default: 0.25)')
-parser.add_argument('--use-prior-kl', action='store_true', default=False,
-                    help='add a kl on the VRNN prior against the true prior (default: False)')
-parser.add_argument('--use-noisy-rnn-state', action='store_true', default=False,
-                    help='uses a noisy initial rnn state instead of zeros (default: False)')
-parser.add_argument('--max-time-steps', type=int, default=0,
-                    help='max time steps for RNN or MSGVAE (default: 0)')
-parser.add_argument('--mut-clamp-strategy', type=str, default="clamp",
-                    help='clamp mut info by norm / clamp / none (default: clamp)')
-parser.add_argument('--mut-clamp-value', type=float, default=100.0,
-                    help='max / min clamp value if above strategy is clamp (default: 100.0)')
-
 # Regularizer
-parser.add_argument('--kl-annealing-cycles', type=int, default=None, help='cycles for kl-annealing (default: None)')
-parser.add_argument('--kl-beta', type=float, default=1, help='beta-vae kl term (default: 1)')
-parser.add_argument('--weight-decay', type=float, default=0, help='weight decay (default: 0)')
+parser.add_argument('--weight-decay', type=float, default=1e-6, help='weight decay (default: 1e-6)')
 parser.add_argument('--polyak-ema', type=float, default=0, help='Polyak weight averaging co-ef (default: 0)')
-parser.add_argument('--conv-normalization', type=str, default='groupnorm',
-                    help='normalization type: batchnorm/groupnorm/instancenorm/none (default: groupnorm)')
-parser.add_argument('--dense-normalization', type=str, default='batchnorm',
-                    help='normalization type: batchnorm/instancenorm/none (default: batchnorm)')
-parser.add_argument('--add-img-noise', action='store_true', default=False,
-                    help='add scattered noise to  images (default: False)')
-
-# Metrics
-parser.add_argument('--calculate-msssim', action='store_true', default=False,
-                    help='enables MS-SSIM (default: False)')
-parser.add_argument('--fid-server', type=str, default=None,
-                    help='fid server url with port;  eg: myhost:8000 (default: None)')
+parser.add_argument('--convert-to-sync-bn', action='store_true', default=True,
+                    help='converts all BNs to SyncBNs (default: True)')
 
 # Optimization related
-parser.add_argument('--lr', type=float, default=4e-4, metavar='LR',
+parser.add_argument('--clip', type=float, default=0,
+                    help='gradient clipping value (default: 0)')
+parser.add_argument('--lr', type=float, default=0.3, metavar='LR',
                     help='learning rate (default: 1e-3)')
-parser.add_argument('--lr-update-schedule', type=str, default='fixed',
-                    help='learning rate schedule fixed/step/cosine (default: fixed)')
-parser.add_argument('--warmup', type=int, default=3,
-                    help='warmup epochs (default: 0)')
-parser.add_argument('--optimizer', type=str, default="adam",
-                    help="specify optimizer (default: adam)")
-parser.add_argument('--early-stop', action='store_true', default=False,
-                    help='enable early stopping (default: False)')
+parser.add_argument('--lr-update-schedule', type=str, default='cosine',
+                    help='learning rate schedule fixed/step/cosine (default: cosine)')
+parser.add_argument('--warmup', type=int, default=10, help='warmup epochs (default: 10)')
+parser.add_argument('--optimizer', type=str, default="lars", help="specify optimizer (default: lars)")
+parser.add_argument('--early-stop', action='store_true', default=False, help='enable early stopping (default: False)')
 
 # Visdom parameters
 parser.add_argument('--visdom-url', type=str, default=None,
@@ -141,8 +84,8 @@ parser.add_argument('--visdom-port', type=int, default=None,
                     help='visdom port for graphs (default: None)')
 
 # Device /debug stuff
-parser.add_argument('--num-replicas', type=int, default=1,
-                    help='number of compute devices available; 1 means just local (default: 1)')
+parser.add_argument('--num-replicas', type=int, default=8,
+                    help='number of compute devices available; 1 means just local (default: 8)')
 parser.add_argument('--workers-per-replica', type=int, default=2,
                     help='threads per replica for the data loader (default: 2)')
 parser.add_argument('--distributed-master', type=str, default='127.0.0.1',
@@ -251,20 +194,16 @@ def build_loader_model_grapher(args):
         else transforms.Lambda(lambda x: x)
 
     # Build the required transforms for our dataset, eg below:
-    # train_transform = [
-    #     transforms.CenterCrop(160),
-    #     resize_xform,
-    #     transforms.RandomApply([transforms.ColorJitter(0.8, 0.8, 0.2)], p=0.8),
-    #     transforms.RandomGrayscale(p=0.1),
-    #     transforms.RandomHorizontalFlip(p=0.5),
-    #     transforms.ToTensor(),
-    #     transforms.RandomApply([transforms.Lambda(lambda x: x + torch.randn(x.shape)*0.02)], p=0.5)]
-    # ]
-    # test_transform = [
-    #     transforms.CenterCrop(160), resize_xform
-    # ]
-    train_transform = [resize_xform]
-    test_transform = [resize_xform]
+    train_transform = [
+        transforms.CenterCrop(250),
+        resize_xform,
+        transforms.RandomApply([transforms.ColorJitter(0.8, 0.8, 0.2)], p=0.8),
+        transforms.RandomGrayscale(p=0.1),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ToTensor(),
+        transforms.RandomApply([transforms.Lambda(lambda x: x + torch.randn(x.shape)*0.02)], p=0.5)
+    ]
+    test_transform = [transforms.CenterCrop(160), resize_xform]
 
     loader_dict = {'train_transform': train_transform,
                    'test_transform': test_transform, **vars(args)}
@@ -279,7 +218,8 @@ def build_loader_model_grapher(args):
     args.total_train_steps = args.epochs * args.steps_per_train_epoch
 
     # build the network
-    network = build_vae(args.vae_type)(loader.input_shape, kwargs=deepcopy(vars(args)))
+    network = models.__dict__[args.arch](pretrained=args.pretrained, num_classes=loader.output_size)
+    network = nn.SyncBatchNorm.convert_sync_batchnorm(network) if args.convert_to_sync_bn else network
     network = network.cuda() if args.cuda else network
     lazy_generate_modules(network, loader.train_loader)
     network = layers.init_weights(network, init=args.weight_initialization)
@@ -319,7 +259,6 @@ def lazy_generate_modules(model, loader):
 
     """
     model.eval()
-    model.config['half'] = False  # disable half here due to CPU weights
     for minibatch, labels in loader:
         with torch.no_grad():
             minibatch = minibatch.cuda(non_blocking=True) if args.cuda else minibatch
@@ -329,9 +268,6 @@ def lazy_generate_modules(model, loader):
     # initialize the polyak-ema op if it exists
     if hasattr(model, 'polyak_ema') and args.polyak_ema > 0:
         layers.polyak_ema_parameters(model, args.polyak_ema)
-
-    # reset half tensors if requested since torch.cuda.HalfTensor has impls
-    model.config['half'] = args.half
 
 
 def register_plots(loss, grapher, epoch, prefix='train'):
@@ -454,24 +390,28 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
         labels = labels.cuda(non_blocking=True) if args.cuda else labels
 
         with torch.no_grad() if prefix == 'test' else utils.dummy_context():
-            if is_eval and args.polyak_ema > 0:                                # use the Polyak model for predictions
-                pred_logits, reparam_map = layers.get_polyak_prediction(
+            if is_eval and args.polyak_ema > 0:                                  # use the Polyak model for predictions
+                pred_logits = layers.get_polyak_prediction(
                     model, pred_fn=functools.partial(model, minibatch))
             else:
-                pred_logits, reparam_map = model(minibatch)                    # get normal predictions
+                pred_logits = model(minibatch)                                   # get normal predictions
 
-            loss_t = model.loss_function(pred_logits, minibatch, reparam_map,  # compute loss
-                                         K=args.monte_carlo_posterior_samples)
-            loss_map = _add_loss_map(loss_map, loss_t)                         # aggregate loss
-            num_samples += minibatch.size(0)                                   # count minibatch samples
+            acc1, acc5 = metrics.topk(output=pred_logits, target=labels, topk=(1, 5))
+            loss_t = {
+                'loss_mean': F.cross_entropy(input=pred_logits, target=labels),  # change to F.mse_loss for regression
+                'top1_mean': acc1,
+                'top5_mean': acc5,
+            }
+            loss_map = _add_loss_map(loss_map, loss_t)                           # aggregate loss
+            num_samples += minibatch.size(0)                                     # count minibatch samples
 
-        if not is_eval:                                                        # compute bp and optimize
-            optimizer.zero_grad()                                              # zero gradients on optimizer
+        if not is_eval:                                                          # compute bp and optimize
+            optimizer.zero_grad()                                                # zero gradients on optimizer
             if args.half:
                 with amp.scale_loss(loss_t['loss_mean'], optimizer) as scaled_loss:
-                    scaled_loss.backward()                                     # compute grads (fp16+fp32)
+                    scaled_loss.backward()                                       # compute grads (fp16+fp32)
             else:
-                loss_t['loss_mean'].backward()                                 # compute grads (fp32)
+                loss_t['loss_mean'].backward()                                   # compute grads (fp32)
 
             if args.clip > 0:
                 # TODO: clip by value or norm? torch.nn.utils.clip_grad_value_
@@ -492,56 +432,25 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     loss_map = _mean_map(loss_map)                                             # reduce the map to get actual means
 
     # log some stuff
-    to_log = '{}-{}[Epoch {}][{} samples][{:.2f} sec]:\t Loss: {:.4f}\t-ELBO: {:.4f}\tNLL: {:.4f}\tKLD: {:.4f}\tMI: {:.4f}'
+    to_log = '{}-{}[Epoch {}][{} samples][{:.2f} sec]:\t Loss: {:.4f}\tTop-1: {:.4f}\tTop-5: {:.4f}'
     print(to_log.format(
         prefix, args.gpu, epoch, num_samples, time.time() - start_time,
         loss_map['loss_mean'].item(),
-        loss_map['elbo_mean'].item(),
-        loss_map['nll_mean'].item(),
-        loss_map['kld_mean'].item(),
-        loss_map['mut_info_mean'].item()))
-
-    # activate the logits of the reconstruction and get the dict
-    reconstr_map = model.get_activated_reconstructions(pred_logits)
-
-    # tack on MSSIM information if requested
-    if args.calculate_msssim:
-        loss_map['ms_ssim_mean'] = metrics.compute_mssim(
-            reconstr_map['reconstruction_imgs'], minibatch)
-
-    # gather scalar values of reparameterizers (if they exist)
-    reparam_scalars = model.get_reparameterizer_scalars()
+        loss_map['top1_mean'].item(),
+        loss_map['top5_mean'].item()))
 
     # plot the test accuracy, loss and images
-    register_plots({**loss_map, **reparam_scalars}, grapher, epoch=epoch, prefix=prefix)
-
-    # get some generations, only do once in a while for pixelcnn
-    generated = None
-    if args.vae_type == 'pixelvae' and epoch % 10 == 0:
-        generated = model.generate_synthetic_samples(args.batch_size, reset_state=True,
-                                                     use_aggregate_posterior=args.use_aggregate_posterior)
-    else:
-        generated = model.generate_synthetic_samples(args.batch_size, reset_state=True,
-                                                     # override_noisy_state=True,
-                                                     use_aggregate_posterior=args.use_aggregate_posterior)
+    register_plots({**loss_map}, grapher, epoch=epoch, prefix=prefix)
 
     # tack on images to grapher
     image_map = {'input_imgs': minibatch}
-    if generated is not None:
-        image_map['generated_imgs'] = generated
-
-    register_images({**image_map, **reconstr_map}, grapher, prefix=prefix)
+    register_images({**image_map}, grapher, prefix=prefix)
     if grapher is not None:
         grapher.save()
 
-    # cleanups (see https://tinyurl.com/ycjre67m) + return ELBO for early stopping
-    loss_val = loss_map['elbo_mean'].detach().item()
-    for d in [loss_map, image_map, reparam_map, reparam_scalars]:
-        d.clear()
-
-    del minibatch
-    del labels
-
+    # cleanups (see https://tinyurl.com/ycjre67m) + return loss for early stopping
+    loss_val = loss_map['loss_mean'].detach().item()
+    loss_map.clear()
     return loss_val
 
 
@@ -627,11 +536,6 @@ def run(rank, num_replicas):
                               larger_is_better=False, max_early_stop_steps=10)
     restore_dict = saver.restore()
     init_epoch = restore_dict['epoch']
-
-    # add the the fid model if requested
-    if args.fid_server is not None:
-        model.fid_client = FIDClient(host=args.fid_server.split(':')[0],
-                                     port=args.fid_server.split(':')[1])
 
     # main training loop
     for epoch in range(init_epoch, args.epochs + 1):

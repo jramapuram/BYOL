@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # pull docker container
-nvidia-docker pull jramapuram/pytorch:1.1.0-cuda10.0
+nvidia-docker pull jramapuram/pytorch:1.5.0-cuda10.1
 
 # make datasets dir in antipication of pulling datasets
 mkdir ~/datasets

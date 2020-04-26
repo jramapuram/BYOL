@@ -49,8 +49,8 @@ parser.add_argument('--no-background', action='store_true', default=False,
                     help='do not run command in background (default=False)')
 parser.add_argument('--cmd', type=str, default=None,
                     help="[required] run this command in the instance (default: None)")
-parser.add_argument('--log-bucket', type=str, default="s3://jramapuram-logs",
-                    help="[required] log to this bucket (default: s3://jramapuram-logs)")
+parser.add_argument('--log-bucket', type=str, default="s3://MY-LOG-BUCKET",
+                    help="[required] log to this bucket (default: s3://MY-LOG-BUCKET)")
 args = parser.parse_args()
 
 
