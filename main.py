@@ -56,6 +56,8 @@ parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50', choices=
                     help='model architecture: ' + ' | '.join(model_names) + ' (default: resnet18)')
 parser.add_argument('--nce-size', type=int, default=128,
                     help='size for NCE loss computation [output of head] (default: 128)')
+parser.add_argument('--head-latent-size', type=int, default=1024,
+                    help='size for hidden layer for the MLP projection head (default: 1024)')
 parser.add_argument('--nce-temperature', type=float, default=0.1,
                     help='temp for NCE loss (default: 0.1)')
 parser.add_argument('--weight-initialization', type=str, default=None,
@@ -93,8 +95,10 @@ parser.add_argument('--num-replicas', type=int, default=8,
                     help='number of compute devices available; 1 means just local (default: 8)')
 parser.add_argument('--workers-per-replica', type=int, default=2,
                     help='threads per replica for the data loader (default: 2)')
-parser.add_argument('--distributed-master', type=str, default='127.0.0.1',
-                    help='hostname or IP to use for distributed master (default: 127.0.0.1)')
+parser.add_argument('--distributed-master', type=str, default=None,
+                    help='hostname or IP to use for distributed master (default: None)')
+parser.add_argument('--distributed-rank', type=int, default=None,
+                    help='rank of the current replica in the world (default: None)')
 parser.add_argument('--distributed-port', type=int, default=29300,
                     help='port to use for distributed framework (default: 29300)')
 parser.add_argument('--debug-step', action='store_true', default=False,
@@ -144,10 +148,10 @@ class SimCLR(nn.Module):
             *list(model_fn(pretrained=False).children())[:-1]  # No dense projection
         )
         self.head = nn.Sequential(
-            nn.Linear(base_network_output_size, 1024),
-            nn.BatchNorm1d(1024),
+            nn.Linear(base_network_output_size, args.head_latent_size),
+            nn.BatchNorm1d(args.head_latent_size),
             nn.ReLU(),
-            nn.Linear(1024, nce_logits_output_size),
+            nn.Linear(args.head_latent_size, nce_logits_output_size),
         )
 
         # The linear classifer head which we will stop-grad to
@@ -264,7 +268,7 @@ def build_loader_model_grapher(args):
     args.total_train_steps = args.epochs * args.steps_per_train_epoch
 
     # build the network
-    network = SimCLR(base_network_output_size=2048,
+    network = SimCLR(base_network_output_size=2048,  # XXX: hardcoded for resnet50
                      nce_logits_output_size=args.nce_size,
                      classifier_output_size=loader.output_size)
     network = nn.SyncBatchNorm.convert_sync_batchnorm(network) if args.convert_to_sync_bn else network
@@ -287,11 +291,11 @@ def build_loader_model_grapher(args):
 
     # build the grapher object
     grapher = None
-    if args.visdom_url and args.gpu == 0:
+    if args.visdom_url and args.distributed_rank == 0:
         grapher = Grapher('visdom', env=utils.get_name(args),
                           server=args.visdom_url,
                           port=args.visdom_port)
-    elif args.gpu == 0:
+    elif args.distributed_rank == 0:
         grapher = Grapher('tensorboard', comment=utils.get_name(args))
 
     return loader, network, grapher
@@ -330,7 +334,7 @@ def register_plots(loss, grapher, epoch, prefix='train'):
     :rtype: None
 
     """
-    if args.gpu == 0 and grapher is not None:  # Only send stuff to visdom once.
+    if args.distributed_rank == 0 and grapher is not None:  # Only send stuff to visdom once.
         for k, v in loss.items():
             if isinstance(v, dict):
                 register_plots(loss[k], grapher, epoch, prefix=prefix)
@@ -351,7 +355,7 @@ def register_images(output_map, grapher, prefix='train'):
     :rtype: None
 
     """
-    if args.gpu == 0 and grapher is not None:  # Only send stuff to visdom once.
+    if args.distributed_rank == 0 and grapher is not None:  # Only send stuff to visdom once.
         for k, v in output_map.items():
             if isinstance(v, dict):
                 register_images(output_map[k], grapher, prefix=prefix)
@@ -492,7 +496,7 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     # log some stuff
     to_log = '{}-{}[Epoch {}][{} samples][{:.2f} sec]:\t Loss: {:.4f}\tTop-1: {:.4f}\tTop-5: {:.4f}'
     print(to_log.format(
-        prefix, args.gpu, epoch, num_samples, time.time() - start_time,
+        prefix, args.distributed_rank, epoch, num_samples, time.time() - start_time,
         loss_map['loss_mean'].item(),
         loss_map['top1_mean'].item(),
         loss_map['top5_mean'].item()))
@@ -544,10 +548,7 @@ def test(epoch, model, test_loader, grapher, prefix='test'):
 
 def init_multiprocessing_and_cuda(rank, num_replicas):
     """Sets the appropriate flags for multi-process jobs."""
-    args.gpu = rank  # Set the GPU device to use and correct cuda flags
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(rank)  # Set the cuda device (internal torch fn fails).
-
-    # Set CUDA after setting environment variable.
+    # Set the cuda flag appropriately
     args.cuda = not args.no_cuda and torch.cuda.is_available()
     if args.cuda:
         torch.backends.cudnn.benchmark = True
@@ -564,9 +565,10 @@ def init_multiprocessing_and_cuda(rank, num_replicas):
 
     if num_replicas > 1:
         torch.distributed.init_process_group(
-            backend='nccl', init_method='env://',
+            backend='nccl', init_method=os.environ['MASTER_ADDR'],
             world_size=args.num_replicas, rank=rank
         )
+        print("Successfully created DDP process group!")
 
         # Update batch size appropriately
         args.batch_size = args.batch_size // num_replicas
@@ -582,14 +584,14 @@ def run(rank, num_replicas):
     """
     init_multiprocessing_and_cuda(rank, num_replicas)           # handle multi-process + cuda init logic
     loader, model, grapher = build_loader_model_grapher(args)   # build the model, loader and grapher
-    # print(pprint.PrettyPrinter(indent=4).pformat(vars(args)))   # print the config to stdout (after ddp changes)
-    optimizer, scheduler = build_optimizer(model)               # the optimizer for the vae
+    print(pprint.PrettyPrinter(indent=4).pformat(vars(args)))   # print the config to stdout (after ddp changes)
+    optimizer, scheduler = build_optimizer(model)               # the optimizer for the model
     if args.half:
         model, optimizer = amp.initialize(model, optimizer, opt_level="O2")
 
     # build the early-stopping (or best-saver) objects and restore if we had a previous model
     model = layers.append_save_and_load_fns(model, optimizer, scheduler, grapher, args)
-    saver = layers.ModelSaver(model, early_stop=args.early_stop, gpu=args.gpu,
+    saver = layers.ModelSaver(model, early_stop=args.early_stop, rank=args.distributed_rank,
                               burn_in_interval=int(0.1 * args.epochs),  # Avoid tons of saving early on.
                               larger_is_better=False, max_early_stop_steps=10)
     restore_dict = saver.restore()
@@ -603,7 +605,6 @@ def run(rank, num_replicas):
 
         # update the learning rate and plot it
         scheduler.step()
-        # register_plots({'learning_rate_scalar': scheduler.get_last_lr()[0]}, grapher, epoch)
         register_plots({'learning_rate_scalar': optimizer.param_groups[0]['lr']}, grapher, epoch)
 
         if saver(test_loss):  # do one more test if we are early stopping
@@ -611,7 +612,9 @@ def run(rank, num_replicas):
             test_loss = test(epoch, model, loader.test_loader, grapher)
             break
 
-        if epoch == 2 and args.gpu == 0:  # make sure we do at least 1 test and train pass
+        # make sure we do at least 1 test and train pass
+        # and only graph using the first node.
+        if epoch == 2 and args.distributed_rank == 0:
             config_to_post = vars(args)
             slurm_id = utils.get_slurm_id()
             if slurm_id is not None:
@@ -625,11 +628,19 @@ def run(rank, num_replicas):
 
 
 if __name__ == "__main__":
-    print(pprint.PrettyPrinter(indent=4).pformat(vars(args)))
     if args.num_replicas > 1:
-        os.environ['MASTER_ADDR'] = args.distributed_master
+        assert args.distributed_rank is not None, "Specify --distributed-rank for DDP."
+        assert args.distributed_master is not None, "Specify --distributed-master for DDP."
+
+        # Set some environment flags
+        endpoint = '{}{}:{}'.format('tcp://' if 'tcp' not in args.distributed_master else '',
+                                    args.distributed_master, args.distributed_port)
+        os.environ['MASTER_ADDR'] = endpoint
         os.environ['MASTER_PORT'] = str(args.distributed_port)
-        mp.spawn(run, nprocs=args.num_replicas, args=(args.num_replicas,))
+        assert utils.number_of_gpus() == 1, "Only 1 GPU per process supported; filter with CUDA_VISIBLE_DEVICES."
+
+        # Distributed launch
+        run(rank=args.distributed_rank, num_replicas=args.num_replicas)
     else:
         # Non-distributed launch
         run(rank=0, num_replicas=args.num_replicas)
