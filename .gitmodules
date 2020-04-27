@@ -1,6 +1,6 @@
 [submodule "datasets"]
 	path = datasets
-	url = git+ssh://git@github.com/jramapuram/datasets
+	url = git+ssh://git@github.com/jramapuram/datasets.git
 [submodule "helpers"]
 	path = helpers
-	url = git+ssh://git@github.com/jramapuram/helpers
+	url = git+ssh://git@github.com/jramapuram/helpers.git

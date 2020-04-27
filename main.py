@@ -15,6 +15,7 @@ import numpy as np
 from torchvision import transforms
 import torchvision.models as models
 
+from objective import nt_xent
 import helpers.metrics as metrics
 import helpers.layers as layers
 import helpers.utils as utils
@@ -34,8 +35,8 @@ model_names = sorted(name for name in models.__dict__
 parser = argparse.ArgumentParser(description='SimCLR Pytorch')
 
 # Task parameters
-parser.add_argument('--task', type=str, default="imagefolder",
-                    help="""task to work on  (default: imagefolder)""")
+parser.add_argument('--task', type=str, default="multi_augment_image_folder",
+                    help="""task to work on  (default: multi_augment_image_folder).""")
 parser.add_argument('--batch-size', type=int, default=4096, metavar='N',
                     help='input batch size for training (default: 4096)')
 parser.add_argument('--epochs', type=int, default=3000, metavar='N',
@@ -53,8 +54,10 @@ parser.add_argument('--uid', type=str, default="",
 # Model related
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50', choices=model_names,
                     help='model architecture: ' + ' | '.join(model_names) + ' (default: resnet18)')
-parser.add_argument('--pretrained', action='store_true', default=False,
-                    help='pull pretrained model weights (default: False)')
+parser.add_argument('--nce-size', type=int, default=128,
+                    help='size for NCE loss computation [output of head] (default: 128)')
+parser.add_argument('--nce-temperature', type=float, default=0.1,
+                    help='temp for NCE loss (default: 0.1)')
 parser.add_argument('--weight-initialization', type=str, default=None,
                     help='weight initialization type; None uses default pytorch init. (default: None)')
 parser.add_argument('--model-dir', type=str, default='.models',
@@ -63,19 +66,21 @@ parser.add_argument('--model-dir', type=str, default='.models',
 # Regularizer
 parser.add_argument('--weight-decay', type=float, default=1e-6, help='weight decay (default: 1e-6)')
 parser.add_argument('--polyak-ema', type=float, default=0, help='Polyak weight averaging co-ef (default: 0)')
-parser.add_argument('--convert-to-sync-bn', action='store_true', default=True,
+parser.add_argument('--convert-to-sync-bn', action='store_true', default=False,#True,
                     help='converts all BNs to SyncBNs (default: True)')
 
 # Optimization related
 parser.add_argument('--clip', type=float, default=0,
                     help='gradient clipping value (default: 0)')
 parser.add_argument('--lr', type=float, default=0.3, metavar='LR',
-                    help='learning rate (default: 1e-3)')
+                    help='learning rate (default: 0.3)')
 parser.add_argument('--lr-update-schedule', type=str, default='cosine',
                     help='learning rate schedule fixed/step/cosine (default: cosine)')
 parser.add_argument('--warmup', type=int, default=10, help='warmup epochs (default: 10)')
-parser.add_argument('--optimizer', type=str, default="lars", help="specify optimizer (default: lars)")
-parser.add_argument('--early-stop', action='store_true', default=False, help='enable early stopping (default: False)')
+parser.add_argument('--optimizer', type=str, default="lars_momentum",
+                    help="specify optimizer (default: lars_momentum)")
+parser.add_argument('--early-stop', action='store_true', default=False,
+                    help='enable early stopping (default: False)')
 
 # Visdom parameters
 parser.add_argument('--visdom-url', type=str, default=None,
@@ -113,6 +118,51 @@ if args.half:
 aws_instance_id = utils.get_aws_instance_id()
 if aws_instance_id is not None:
     args.instance_id = aws_instance_id
+
+
+class SimCLR(nn.Module):
+    """Simple SIMCLR implementation."""
+
+    def __init__(self, base_network_output_size,
+                 nce_logits_output_size,
+                 classifier_output_size):
+        """SimCLR model.
+
+        :param base_network_output_size: output-size of resnet50 embedding
+        :param nce_logits_output_size: output-size to use for NCE loss
+        :param classifier_output_size: number of classes in classifier problem
+        :returns: SimCLR object
+        :rtype: nn.Module
+
+        """
+        super(SimCLR, self).__init__()
+        self.base_network_output_size = base_network_output_size
+
+        # The base network and the head network used for the self-supervised objective
+        model_fn = models.__dict__[args.arch]
+        self.base_network = nn.Sequential(
+            *list(model_fn(pretrained=False).children())[:-1]  # No dense projection
+        )
+        self.head = nn.Sequential(
+            nn.Linear(base_network_output_size, 1024),
+            nn.BatchNorm1d(1024),
+            nn.ReLU(),
+            nn.Linear(1024, nce_logits_output_size),
+        )
+
+        # The linear classifer head which we will stop-grad to
+        self.linear_classifier = nn.Linear(base_network_output_size, classifier_output_size)
+
+    def forward(self, augmentation1, augmentation2):
+        """Returns the NCE logits and the linear predictions."""
+        representation1 = self.base_network(augmentation1).view(-1, self.base_network_output_size)
+        representation2 = self.base_network(augmentation2).view(-1, self.base_network_output_size)
+        logits_for_nce1 = self.head(representation1)
+        logits_for_nce2 = self.head(representation2)
+
+        # Stop-gradients to the classifier to not learn a trivially better model.
+        linear_preds = self.linear_classifier(representation1.clone().detach())
+        return logits_for_nce1, logits_for_nce2, linear_preds
 
 
 def build_lr_schedule(optimizer, last_epoch=-1):
@@ -189,24 +239,20 @@ def build_loader_model_grapher(args):
     :rtype: list
 
     """
-    resize_shape = (args.image_size_override, args.image_size_override)
-    resize_xform = transforms.Resize(resize_shape) if args.image_size_override \
-        else transforms.Lambda(lambda x: x)
-
     # Build the required transforms for our dataset, eg below:
     train_transform = [
-        transforms.CenterCrop(250),
-        resize_xform,
-        transforms.RandomApply([transforms.ColorJitter(0.8, 0.8, 0.2)], p=0.8),
-        transforms.RandomGrayscale(p=0.1),
+        transforms.CenterCrop(256),
+        transforms.RandomResizedCrop((args.image_size_override, args.image_size_override)),
         transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomApply([transforms.ColorJitter(0.8, 0.8, 0.2)], p=0.8),
+        transforms.RandomGrayscale(p=0.2),
         transforms.ToTensor(),
-        transforms.RandomApply([transforms.Lambda(lambda x: x + torch.randn(x.shape)*0.02)], p=0.5)
+        #transforms.RandomApply([transforms.Lambda(lambda x: x + torch.randn(x.shape)*0.02)], p=0.5)
     ]
-    test_transform = [transforms.CenterCrop(160), resize_xform]
-
+    test_transform = [transforms.CenterCrop(args.image_size_override)]
     loader_dict = {'train_transform': train_transform,
-                   'test_transform': test_transform, **vars(args)}
+                   'test_transform': test_transform,
+                   **vars(args)}
     loader = get_loader(**loader_dict)
 
     # set the input tensor shape (ignoring batch dimension) and related dataset sizing
@@ -218,7 +264,9 @@ def build_loader_model_grapher(args):
     args.total_train_steps = args.epochs * args.steps_per_train_epoch
 
     # build the network
-    network = models.__dict__[args.arch](pretrained=args.pretrained, num_classes=loader.output_size)
+    network = SimCLR(base_network_output_size=2048,
+                     nce_logits_output_size=args.nce_size,
+                     classifier_output_size=loader.output_size)
     network = nn.SyncBatchNorm.convert_sync_batchnorm(network) if args.convert_to_sync_bn else network
     network = network.cuda() if args.cuda else network
     lazy_generate_modules(network, loader.train_loader)
@@ -259,10 +307,11 @@ def lazy_generate_modules(model, loader):
 
     """
     model.eval()
-    for minibatch, labels in loader:
+    for augmentation1, augmentation2, labels in loader:
         with torch.no_grad():
-            minibatch = minibatch.cuda(non_blocking=True) if args.cuda else minibatch
-            _ = model(minibatch)
+            augmentation1 = augmentation1.cuda(non_blocking=True) if args.cuda else augmentation1
+            augmentation2 = augmentation2.cuda(non_blocking=True) if args.cuda else augmentation2
+            _ = model(augmentation1, augmentation2)
             break
 
     # initialize the polyak-ema op if it exists
@@ -385,25 +434,34 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     loss_map, num_samples = {}, 0
 
     # iterate over data and labels
-    for minibatch, labels in loader:
-        minibatch = minibatch.cuda(non_blocking=True) if args.cuda else minibatch
+    for augmentation1, augmentation2, labels in loader:
+        augmentation1 = augmentation1.cuda(non_blocking=True) if args.cuda else augmentation1
+        augmentation2 = augmentation2.cuda(non_blocking=True) if args.cuda else augmentation2
         labels = labels.cuda(non_blocking=True) if args.cuda else labels
 
         with torch.no_grad() if prefix == 'test' else utils.dummy_context():
             if is_eval and args.polyak_ema > 0:                                  # use the Polyak model for predictions
-                pred_logits = layers.get_polyak_prediction(
-                    model, pred_fn=functools.partial(model, minibatch))
+                nce_logits1, nce_logits2, linear_preds = layers.get_polyak_prediction(
+                    model, pred_fn=functools.partial(model, augmentation1, augmentation2))
             else:
-                pred_logits = model(minibatch)                                   # get normal predictions
+                nce_logits1, nce_logits2, linear_preds = model(augmentation1,
+                                                               augmentation2)    # get normal predictions
 
-            acc1, acc5 = metrics.topk(output=pred_logits, target=labels, topk=(1, 5))
+            # The loss is the NCE loss + classifer loss (with stop-grad of course).
+            acc1, acc5 = metrics.topk(output=linear_preds, target=labels, topk=(1, 5))
+            nce_loss = nt_xent(nce_logits1, nce_logits2,
+                               temperature=args.nce_temperature,
+                               num_replicas=args.num_replicas)
+            classifier_loss = F.cross_entropy(input=linear_preds, target=labels)
             loss_t = {
-                'loss_mean': F.cross_entropy(input=pred_logits, target=labels),  # change to F.mse_loss for regression
+                'loss_mean': nce_loss + classifier_loss,
+                'nce_loss_mean': nce_loss,
+                'linear_loss_mean': classifier_loss,
                 'top1_mean': acc1,
                 'top5_mean': acc5,
             }
             loss_map = _add_loss_map(loss_map, loss_t)                           # aggregate loss
-            num_samples += minibatch.size(0)                                     # count minibatch samples
+            num_samples += augmentation1.size(0)                                 # count minibatch samples
 
         if not is_eval:                                                          # compute bp and optimize
             optimizer.zero_grad()                                                # zero gradients on optimizer
@@ -443,7 +501,7 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     register_plots({**loss_map}, grapher, epoch=epoch, prefix=prefix)
 
     # tack on images to grapher
-    image_map = {'input_imgs': minibatch}
+    image_map = {'augmentation1_imgs': augmentation1, 'augmentation2_imgs': augmentation2}
     register_images({**image_map}, grapher, prefix=prefix)
     if grapher is not None:
         grapher.save()
@@ -524,7 +582,7 @@ def run(rank, num_replicas):
     """
     init_multiprocessing_and_cuda(rank, num_replicas)           # handle multi-process + cuda init logic
     loader, model, grapher = build_loader_model_grapher(args)   # build the model, loader and grapher
-    print(pprint.PrettyPrinter(indent=4).pformat(vars(args)))   # print the config to stdout (after ddp changes)
+    # print(pprint.PrettyPrinter(indent=4).pformat(vars(args)))   # print the config to stdout (after ddp changes)
     optimizer, scheduler = build_optimizer(model)               # the optimizer for the vae
     if args.half:
         model, optimizer = amp.initialize(model, optimizer, opt_level="O2")
@@ -567,6 +625,7 @@ def run(rank, num_replicas):
 
 
 if __name__ == "__main__":
+    print(pprint.PrettyPrinter(indent=4).pformat(vars(args)))
     if args.num_replicas > 1:
         os.environ['MASTER_ADDR'] = args.distributed_master
         os.environ['MASTER_PORT'] = str(args.distributed_port)
