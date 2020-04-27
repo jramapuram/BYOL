@@ -251,7 +251,7 @@ def build_loader_model_grapher(args):
         transforms.RandomApply([transforms.ColorJitter(0.8, 0.8, 0.2)], p=0.8),
         transforms.RandomGrayscale(p=0.2),
         transforms.ToTensor(),
-        #transforms.RandomApply([transforms.Lambda(lambda x: x + torch.randn(x.shape)*0.02)], p=0.5)
+        # transforms.RandomApply([transforms.Lambda(lambda x: x + torch.randn(x.shape)*0.02)], p=0.5)
     ]
     test_transform = [transforms.CenterCrop(args.image_size_override)]
     loader_dict = {'train_transform': train_transform,
