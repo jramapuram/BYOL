@@ -29,7 +29,7 @@ echo "master is $MASTER"
 #     chmod -R 777 /opt
 
 # Then build the container:
-# sudo singularity build MYRULES
+# sudo singularity build pytorch1.5.0_cuda10.1.simg MYRULES
 
 # Profit (after setting DATA_DIR below)
 
