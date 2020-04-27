@@ -4,8 +4,8 @@ An implementation of [SimCLR](https://arxiv.org/abs/2002.05709) in pytorch.
 
 
 ## Usage Single GPU
-**NOTE**: this will not produce good results. The paper by the authors use a batch size of 4096 for SOTA.
-**NOTE**: Setup your github ssh tokens; if you get an authentication issue this is most likely it.
+**NOTE0**: this will not produce good results. The paper by the authors use a batch size of 4096 for SOTA.  
+**NOTE1**: Setup your github ssh tokens; if you get an authentication issue from the git clone this is most likely it.
 
 
 ``` bash
