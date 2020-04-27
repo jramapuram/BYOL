@@ -38,6 +38,7 @@ Setup stuff according to the [slurm bash script](./slurm/run.sh). Then:
 
   1. Start each replica worker pointing to the master using `--distributed-master=`
   2. Set the total number of replicas appropriately using `--num-replicas=`
+  3. Set each node to have a unique `--distributed-rank=` ranging from `[0, num_replicas]`
   3. Ensure network connectivity between workers. You will get NCCL errors if there are resolution problems here.
   4. Profit
   
