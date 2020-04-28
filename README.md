@@ -42,6 +42,15 @@ Setup stuff according to the [slurm bash script](./slurm/run.sh). Then:
   3. Ensure network connectivity between workers. You will get NCCL errors if there are resolution problems here.
   4. Profit
   
+## FP16 support
+
+If you have GPUs that work well with FP16 you can try the `--half` flag.  
+This will allow faster training with larger batch sizes (~100 w/12Gb GPU memory).  
+If training doesn't work well try chaning the [AMP optimization](https://nvidia.github.io/apex/amp.html#opt-levels) level [here](https://github.com/jramapuram/SimCLR/blob/master/main.py#L590)
+
+## IO Bound?
+
+Try increasing `--workers-per-replica` for dataloading or placing your dataset on a drive with larger IOPS.
   
 ## Citation
 
