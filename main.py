@@ -594,36 +594,41 @@ def test(epoch, model, test_loader, grapher, prefix='test'):
     return execute_graph(epoch, model, test_loader, grapher, prefix='test')
 
 
-def init_multiprocessing_and_cuda(rank, args):
+def init_multiprocessing_and_cuda(rank, args_from_spawn):
     """Sets the appropriate flags for multi-process jobs."""
-    if args.multi_gpu_distributed:
+    if args_from_spawn.multi_gpu_distributed:
         # Force set the GPU device in the case where a single node has >1 GPU
         os.environ['CUDA_VISIBLE_DEVICES'] = str(rank)
+        args_from_spawn.distributed_rank = rank
 
     # Set the cuda flag appropriately
-    args.cuda = not args.no_cuda and torch.cuda.is_available()
-    if args.cuda:
+    args_from_spawn.cuda = not args_from_spawn.no_cuda and torch.cuda.is_available()
+    if args_from_spawn.cuda:
         torch.backends.cudnn.benchmark = True
         print("Replica {} / {} using GPU: {}".format(
-            rank + 1, args.num_replicas, torch.cuda.get_device_name(0)))
+            rank + 1, args_from_spawn.num_replicas, torch.cuda.get_device_name(0)))
 
     # set a fixed seed for GPUs and CPU
-    if args.seed is not None:
-        print("setting seed %d" % args.seed)
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
-        if args.cuda:
-            torch.cuda.manual_seed_all(args.seed)
+    if args_from_spawn.seed is not None:
+        print("setting seed %d" % args_from_spawn.seed)
+        np.random.seed(args_from_spawn.seed)
+        torch.manual_seed(args_from_spawn.seed)
+        if args_from_spawn.cuda:
+            torch.cuda.manual_seed_all(args_from_spawn.seed)
 
-    if args.num_replicas > 1:
+    if args_from_spawn.num_replicas > 1:
         torch.distributed.init_process_group(
             backend='nccl', init_method=os.environ['MASTER_ADDR'],
-            world_size=args.num_replicas, rank=rank
+            world_size=args_from_spawn.num_replicas, rank=rank
         )
         print("Successfully created DDP process group!")
 
         # Update batch size appropriately
-        args.batch_size = args.batch_size // args.num_replicas
+        args_from_spawn.batch_size = args_from_spawn.batch_size // args_from_spawn.num_replicas
+
+    # set the global argparse
+    global args
+    args = args_from_spawn
 
 
 def run(rank, args):
@@ -702,7 +707,7 @@ if __name__ == "__main__":
             mp.spawn(run, nprocs=args.num_replicas, args=(args,))
         else:
             # Single device in this entire process
-            print("detected single node - single gpu setup")
+            print("detected distributed with 1 gpu - 1 process setup")
             assert num_gpus == 1, "Only 1 GPU per process supported; filter with CUDA_VISIBLE_DEVICES."
             run(rank=args.distributed_rank, args=args)
 
