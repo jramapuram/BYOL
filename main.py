@@ -222,7 +222,10 @@ def build_optimizer(model, last_epoch=-1):
     print("using {} optimizer {} lars.".format(opt_name, 'with'if is_lars else 'without'))
 
     # Build the base optimizer
-    lr = args.lr * (args.batch_size / 256) if opt_name not in ["adam", "rmsprop"] else args.lr  # Following SimCLR
+    lr = args.lr
+    if opt_name in ["momentum", "sgd"]:
+        lr = args.lr * (args.batch_size * args.num_replicas / 256)  # Following SimCLR
+
     opt = optim_map[opt_name](params_to_optimize, lr=lr)
 
     # Wrap it with LARS if requested
@@ -234,17 +237,13 @@ def build_optimizer(model, last_epoch=-1):
     return opt, sched
 
 
-def build_train_and_test_transforms(first_center_crop_size=256):
+def build_train_and_test_transforms():
     """Returns torchvision OR nvidia-dali transforms.
 
-    :param first_center_crop_size: the first center crop before resize, etc
     :returns: train_transforms, test_transforms
     :rtype: list, list
 
     """
-    if args.image_size_override is not None:
-        assert first_center_crop_size > args.image_size_override, "First crop needs to be > image-size-override."
-
     resize_shape = (args.image_size_override, args.image_size_override)
 
     if 'dali' in args.task:
@@ -253,21 +252,17 @@ def build_train_and_test_transforms(first_center_crop_size=256):
         import nvidia.dali.types as types
         from datasets.dali_imagefolder import ColorJitter, RandomHorizontalFlip
 
-        first_center_crop = (first_center_crop_size, first_center_crop_size)
-
         train_transform = [
             ops.RandomResizedCrop(device="gpu" if args.cuda else "cpu",
                                   size=resize_shape,
                                   random_area=(0.08, 1.0),
                                   random_aspect_ratio=(3./4, 4./3)),
-            ColorJitter(brightness=0.8, contrast=0.8, saturation=0.2, prob=0.8, cuda=args.cuda),
-            RandomHorizontalFlip(prob=0.2, cuda=args.cuda)
+            RandomHorizontalFlip(prob=0.2, cuda=args.cuda),
+            ColorJitter(brightness=0.8, contrast=0.8, saturation=0.2, prob=0.8, cuda=args.cuda)
             #  RandomGrayScale(prob=1.0, cuda=args.cuda)  # currently does not work
+            # TODO: Gaussian-blur
         ]
         test_transform = [
-            ops.Resize(resize_shorter=first_center_crop_size,
-                       device="gpu" if args.cuda else "cpu"),
-            ops.Crop(device="gpu" if args.cuda else "cpu", crop=first_center_crop),
             ops.Resize(resize_x=resize_shape[0],
                        resize_y=resize_shape[1],
                        device="gpu" if args.cuda else "cpu",
@@ -285,7 +280,7 @@ def build_train_and_test_transforms(first_center_crop_size=256):
             transforms.RandomGrayscale(p=0.2),
             GaussianBlur(kernel_size=int(0.1 * args.image_size_override), p=0.5)
         ]
-        test_transform = [transforms.CenterCrop(args.image_size_override)]
+        test_transform = [transforms.Resize(resize_shape)]
 
     return train_transform, test_transform
 
