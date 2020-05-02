@@ -25,10 +25,6 @@ If you want to setup your own environment use:
   
 or just take a look at the Dockerfile in `docker/Dockerfile`.
 
-## Setup data
-
-Grab imagenet, [do standard pre-processing](https://github.com/soumith/imagenet-multiGPU.torch#data-processing) and use `--data-dir=${DATA_DIR}`. **Note:** This SimCLR implementation expectes two pytorch `imagefolder` locations: `train` and `test` as opposed to `val` in the preprocessor above.
-
 ## Usage SLURM
 
 Setup stuff according to the [slurm bash script](./slurm/run.sh). Then:
@@ -45,7 +41,11 @@ Setup stuff according to the [slurm bash script](./slurm/run.sh). Then:
   3. Set each node to have a unique `--distributed-rank=` ranging from `[0, num_replicas]`.
   3. Ensure network connectivity between workers. You will get NCCL errors if there are resolution problems here.
   4. Profit.
-  
+
+## Setup data
+
+Grab imagenet, [do standard pre-processing](https://github.com/soumith/imagenet-multiGPU.torch#data-processing) and use `--data-dir=${DATA_DIR}`. **Note:** This SimCLR implementation expectes two pytorch `imagefolder` locations: `train` and `test` as opposed to `val` in the preprocessor above.
+
 ## FP16 support
 
 If you have GPUs that work well with FP16 you can try the `--half` flag.  
