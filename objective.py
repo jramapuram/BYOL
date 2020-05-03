@@ -42,8 +42,8 @@ def nt_xent(embedding1, embedding2, temperature=0.1, num_replicas=None):
 
     if num_replicas > 1:
         # First grab the tensor from all other embeddings
-        embedding1_full = all_gather(embedding1)
-        embedding2_full = all_gather(embedding2)
+        embedding1_full = all_gather(embedding1, num_replicas=num_replicas)
+        embedding2_full = all_gather(embedding2, num_replicas=num_replicas)
 
         # fold the tensor in to create [B, F]
         embedding1_full = embedding1_full.reshape(-1, feature_size)
@@ -54,16 +54,13 @@ def nt_xent(embedding1, embedding2, temperature=0.1, num_replicas=None):
         labels = torch.arange(batch_size, device=embedding1.device) + replica_id * batch_size
         labels = labels.type(torch.int64)
         full_batch_size = embedding1_full.shape[0]
-        cur_replica_labels = F.one_hot(labels, full_batch_size).to(embedding1_full.device)
-        other_replica_labels = F.one_hot(labels, full_batch_size * 2).to(embedding1_full.device)
+        masks = F.one_hot(labels, full_batch_size).to(embedding1_full.device)
+        labels = F.one_hot(labels, full_batch_size * 2).to(embedding1_full.device)
     else:
         embedding1_full = embedding1
         embedding2_full = embedding2
-        cur_replica_labels = F.one_hot(torch.arange(batch_size), batch_size).to(embedding1.device)
-        other_replica_labels = F.one_hot(torch.arange(batch_size), batch_size * 2).to(embedding1.device)
-
-    masks = cur_replica_labels     # Mask out non-corresponding samples
-    labels = other_replica_labels  # One-hot labels
+        masks = F.one_hot(torch.arange(batch_size), batch_size).to(embedding1.device)
+        labels = F.one_hot(torch.arange(batch_size), batch_size * 2).to(embedding1.device)
 
     # Matmul-to-mask
     logits_aa = torch.matmul(embedding1, embedding1_full.T) / temperature

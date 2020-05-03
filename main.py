@@ -1,5 +1,6 @@
 import os
 import time
+import tree
 import argparse
 import functools
 import pprint
@@ -54,6 +55,8 @@ parser.add_argument('--uid', type=str, default="",
 # Model related
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50', choices=model_names,
                     help='model architecture: ' + ' | '.join(model_names) + ' (default: resnet18)')
+parser.add_argument('--representation-size', type=int, default=2048,
+                    help='size of the representation (eg: final AvgPool for resnet) (default: 2048)')
 parser.add_argument('--nce-size', type=int, default=128,
                     help='size for NCE loss computation [output of head] (default: 128)')
 parser.add_argument('--head-latent-size', type=int, default=1024,
@@ -141,6 +144,7 @@ class SimCLR(nn.Module):
         """
         super(SimCLR, self).__init__()
         self.base_network_output_size = base_network_output_size
+        self.polyak_ema = layers.EMA(args.polyak_ema) if args.polyak_ema > 0 else None
 
         # The base network and the head network used for the self-supervised objective
         model_fn = models.__dict__[args.arch]
@@ -310,7 +314,7 @@ def build_loader_model_grapher(args):
     args.total_train_steps = args.epochs * args.steps_per_train_epoch
 
     # build the network
-    network = SimCLR(base_network_output_size=2048,  # XXX: hardcoded for resnet50
+    network = SimCLR(base_network_output_size=args.representation_size,
                      nce_logits_output_size=args.nce_size,
                      classifier_output_size=loader.output_size)
     network = nn.SyncBatchNorm.convert_sync_batchnorm(network) if args.convert_to_sync_bn else network
@@ -410,54 +414,12 @@ def register_images(output_map, grapher, prefix='train'):
                                   global_step=0)  # dont use step
 
 
-def _add_loss_map(loss_tm1, loss_t):
-    """ Adds the current dict _t to the previous running dict _tm1
+def _extract_sum_scalars(v1, v2):
+    """Simple helper to sum values in a struct using dm_tree."""
+    if not isinstance(v2, (float, np.float32, np.float64)):
+        return v1 + v2.detach()
 
-    :param loss_tm1: a dict of previous losses
-    :param loss_t: a dict of the current losses
-    :returns: a new dict with added values and updated count
-    :rtype: dict
-
-    """
-    if not loss_tm1:  # base case: empty dict
-        resultant = {'count': 1}
-        for k, v in loss_t.items():
-            if 'mean' in k or 'scalar' in k:
-                if not isinstance(v, (float, int, np.float32, np.float64)):
-                    resultant[k] = v.detach()
-                else:
-                    resultant[k] = v
-
-        return resultant
-
-    resultant = {}
-    for (k, v) in loss_t.items():
-        if 'mean' in k or 'scalar' in k:
-            if not isinstance(v, (float, np.float32, np.float64)):
-                resultant[k] = loss_tm1[k] + v.detach()
-            else:
-                resultant[k] = loss_tm1[k] + v
-
-    # increment total count
-    resultant['count'] = loss_tm1['count'] + 1
-    return resultant
-
-
-def _mean_map(loss_map):
-    """ Simply scales all values in the dict by the count
-
-    :param loss_map: the dict of scalars
-    :returns: mean of the dict
-    :rtype: dict
-
-    """
-    for k in loss_map.keys():
-        if k == 'count':
-            continue
-
-        loss_map[k] /= loss_map['count']
-
-    return loss_map
+    return v1 + v2
 
 
 def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
@@ -480,7 +442,7 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     loss_map, num_samples = {}, 0
 
     # iterate over data and labels
-    for augmentation1, augmentation2, labels in loader:
+    for num_minibatches, (augmentation1, augmentation2, labels) in enumerate(loader):
         augmentation1 = augmentation1.cuda(non_blocking=True) if args.cuda else augmentation1
         augmentation2 = augmentation2.cuda(non_blocking=True) if args.cuda else augmentation2
         labels = labels.cuda(non_blocking=True) if args.cuda else labels
@@ -506,7 +468,8 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
                 'top1_mean': acc1,
                 'top5_mean': acc5,
             }
-            loss_map = _add_loss_map(loss_map, loss_t)                           # aggregate loss
+            loss_map = loss_t if not loss_map else tree.map_structure(           # aggregate loss
+                _extract_sum_scalars, loss_map, loss_t)
             num_samples += augmentation1.size(0)                                 # count minibatch samples
 
         if not is_eval:                                                          # compute bp and optimize
@@ -519,12 +482,11 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
 
             if args.clip > 0:
                 # TODO: clip by value or norm? torch.nn.utils.clip_grad_value_
-                # torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip) \
-                nn.utils.clip_grad_value_(model.parameters(), args.clip) \
-                    if not args.half else optimizer.clip_master_grads(args.clip)
+                # torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+                nn.utils.clip_grad_value_(model.parameters(), args.clip)
 
             optimizer.step()
-            if args.polyak_ema > 0:                                            # update Polyak mean if requested
+            if args.polyak_ema > 0:                                              # update Polyak mean if requested
                 layers.polyak_ema_parameters(model, args.polyak_ema)
 
             del loss_t
@@ -532,8 +494,9 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
         if args.debug_step:  # for testing purposes
             break
 
-    # compute the mean of the map
-    loss_map = _mean_map(loss_map)                                             # reduce the map to get actual means
+    # compute the mean of the dict
+    loss_map = tree.map_structure(
+        lambda v: v / (num_minibatches + 1), loss_map)                           # reduce the map to get actual means
 
     # log some stuff
     to_log = '{}-{}[Epoch {}][{} samples][{:.2f} sec]:\t Loss: {:.4f}\tTop-1: {:.4f}\tTop-5: {:.4f}'
