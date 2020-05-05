@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
@@ -20,63 +21,69 @@ def all_gather(tensor, expand_dim=0, num_replicas=None):
     return torch.cat([o.unsqueeze(expand_dim) for o in other_replica_tensors], expand_dim)
 
 
-def nt_xent(embedding1, embedding2, temperature=0.1, num_replicas=None):
-    """NT-XENT Loss from SimCLR
+class NTXent(nn.Module):
+    """Wrap a module to get self.training member."""
 
-    :param embedding1: embedding of augmentation1
-    :param embedding2: embedding of augmentation2
-    :param temperature: nce normalization temp
-    :param num_replicas: number of compute devices
-    :returns: scalar loss
-    :rtype: float32
+    def __init__(self):
+        super(NTXent, self).__init__()
 
-    """
-    batch_size = embedding1.shape[0]
-    feature_size = embedding1.shape[-1]
-    num_replicas = dist.get_world_size() if num_replicas is None else num_replicas
-    infinity = 1e9
+    def forward(self, embedding1, embedding2, temperature=0.1, num_replicas=None):
+        """NT-XENT Loss from SimCLR
 
-    # normalize both embeddings
-    embedding1 = l2_normalize(embedding1, dim=-1)
-    embedding2 = l2_normalize(embedding2, dim=-1)
+        :param embedding1: embedding of augmentation1
+        :param embedding2: embedding of augmentation2
+        :param temperature: nce normalization temp
+        :param num_replicas: number of compute devices
+        :returns: scalar loss
+        :rtype: float32
 
-    if num_replicas > 1:
-        # First grab the tensor from all other embeddings
-        embedding1_full = all_gather(embedding1, num_replicas=num_replicas)
-        embedding2_full = all_gather(embedding2, num_replicas=num_replicas)
+        """
+        batch_size = embedding1.shape[0]
+        feature_size = embedding1.shape[-1]
+        num_replicas = dist.get_world_size() if num_replicas is None else num_replicas
+        infinity = 1e9
 
-        # fold the tensor in to create [B, F]
-        embedding1_full = embedding1_full.reshape(-1, feature_size)
-        embedding2_full = embedding2_full.reshape(-1, feature_size)
+        # normalize both embeddings
+        embedding1 = l2_normalize(embedding1, dim=-1)
+        embedding2 = l2_normalize(embedding2, dim=-1)
 
-        # Create pseudo-labels using the current replica id & ont-hotting
-        replica_id = dist.get_rank()
-        labels = torch.arange(batch_size, device=embedding1.device) + replica_id * batch_size
-        labels = labels.type(torch.int64)
-        full_batch_size = embedding1_full.shape[0]
-        masks = F.one_hot(labels, full_batch_size).to(embedding1_full.device)
-        labels = F.one_hot(labels, full_batch_size * 2).to(embedding1_full.device)
-    else:
-        embedding1_full = embedding1
-        embedding2_full = embedding2
-        masks = F.one_hot(torch.arange(batch_size), batch_size).to(embedding1.device)
-        labels = F.one_hot(torch.arange(batch_size), batch_size * 2).to(embedding1.device)
+        if num_replicas > 1 and self.training:
+            # First grab the tensor from all other embeddings
+            embedding1_full = all_gather(embedding1, num_replicas=num_replicas)
+            embedding2_full = all_gather(embedding2, num_replicas=num_replicas)
 
-    # Matmul-to-mask
-    logits_aa = torch.matmul(embedding1, embedding1_full.T) / temperature
-    logits_aa = logits_aa - masks * infinity
-    logits_bb = torch.matmul(embedding2, embedding2_full.T) / temperature
-    logits_bb = logits_bb - masks * infinity
-    logits_ab = torch.matmul(embedding1, embedding2_full.T) / temperature
-    logits_ba = torch.matmul(embedding2, embedding1_full.T) / temperature
+            # fold the tensor in to create [B, F]
+            embedding1_full = embedding1_full.reshape(-1, feature_size)
+            embedding2_full = embedding2_full.reshape(-1, feature_size)
 
-    # Use our standard cross-entropy loss which uses log-softmax internally.
-    # Concat on the feature dimension to provide all features for standard softmax-xent
-    loss_a = F.cross_entropy(input=torch.cat([logits_ab, logits_aa], 1),
-                             target=torch.argmax(labels, -1),
-                             reduction="none")
-    loss_b = F.cross_entropy(input=torch.cat([logits_ba, logits_bb], 1),
-                             target=torch.argmax(labels, -1),
-                             reduction="none")
-    loss = loss_a + loss_b
-    return torch.mean(loss)
+            # Create pseudo-labels using the current replica id & ont-hotting
+            replica_id = dist.get_rank()
+            labels = torch.arange(batch_size, device=embedding1.device) + replica_id * batch_size
+            labels = labels.type(torch.int64)
+            full_batch_size = embedding1_full.shape[0]
+            masks = F.one_hot(labels, full_batch_size).to(embedding1_full.device)
+            labels = F.one_hot(labels, full_batch_size * 2).to(embedding1_full.device)
+        else:  # no replicas or we are in test mode; test set is same size on all replicas for now
+            embedding1_full = embedding1
+            embedding2_full = embedding2
+            masks = F.one_hot(torch.arange(batch_size), batch_size).to(embedding1.device)
+            labels = F.one_hot(torch.arange(batch_size), batch_size * 2).to(embedding1.device)
+
+        # Matmul-to-mask
+        logits_aa = torch.matmul(embedding1, embedding1_full.T) / temperature
+        logits_aa = logits_aa - masks * infinity
+        logits_bb = torch.matmul(embedding2, embedding2_full.T) / temperature
+        logits_bb = logits_bb - masks * infinity
+        logits_ab = torch.matmul(embedding1, embedding2_full.T) / temperature
+        logits_ba = torch.matmul(embedding2, embedding1_full.T) / temperature
+
+        # Use our standard cross-entropy loss which uses log-softmax internally.
+        # Concat on the feature dimension to provide all features for standard softmax-xent
+        loss_a = F.cross_entropy(input=torch.cat([logits_ab, logits_aa], 1),
+                                 target=torch.argmax(labels, -1),
+                                 reduction="none")
+        loss_b = F.cross_entropy(input=torch.cat([logits_ba, logits_bb], 1),
+                                 target=torch.argmax(labels, -1),
+                                 reduction="none")
+        loss = loss_a + loss_b
+        return torch.mean(loss)

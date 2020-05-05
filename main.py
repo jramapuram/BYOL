@@ -16,7 +16,7 @@ import numpy as np
 from torchvision import transforms
 import torchvision.models as models
 
-from objective import nt_xent
+from objective import NTXent
 import helpers.metrics as metrics
 import helpers.layers as layers
 import helpers.utils as utils
@@ -441,6 +441,9 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     assert optimizer is None if is_eval else optimizer is not None
     loss_map, num_samples = {}, 0
 
+    # the NT-Xent loss from SimCLR
+    objective = NTXent()
+
     # iterate over data and labels
     for num_minibatches, (augmentation1, augmentation2, labels) in enumerate(loader):
         augmentation1 = augmentation1.cuda(non_blocking=True) if args.cuda else augmentation1
@@ -457,9 +460,9 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
 
             # The loss is the NCE loss + classifer loss (with stop-grad of course).
             acc1, acc5 = metrics.topk(output=linear_preds, target=labels, topk=(1, 5))
-            nce_loss = nt_xent(nce_logits1, nce_logits2,
-                               temperature=args.nce_temperature,
-                               num_replicas=args.num_replicas)
+            nce_loss = objective(nce_logits1, nce_logits2,
+                                 temperature=args.nce_temperature,
+                                 num_replicas=args.num_replicas)
             classifier_loss = F.cross_entropy(input=linear_preds, target=labels)
             loss_t = {
                 'loss_mean': nce_loss + classifier_loss,
