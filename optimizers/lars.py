@@ -65,6 +65,10 @@ class LARS(Optimizer):
     def param_groups(self):
         return self.optim.param_groups
 
+    @property
+    def state(self):
+        return self.optim.state
+
     def state_dict(self):
         return self.optim.state_dict()
 
