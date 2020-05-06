@@ -69,6 +69,8 @@ parser.add_argument('--model-dir', type=str, default='.models',
                     help='directory which contains saved models (default: .models)')
 
 # Regularizer
+parser.add_argument('--color-jitter-strength', type=float, default=1.0,
+                    help='scalar weighting for the color jitter (default: 1.0)')
 parser.add_argument('--weight-decay', type=float, default=1e-6, help='weight decay (default: 1e-6)')
 parser.add_argument('--polyak-ema', type=float, default=0, help='Polyak weight averaging co-ef (default: 0)')
 parser.add_argument('--convert-to-sync-bn', action='store_true', default=False,#True,
@@ -262,7 +264,11 @@ def build_train_and_test_transforms():
                                   random_area=(0.08, 1.0),
                                   random_aspect_ratio=(3./4, 4./3)),
             RandomHorizontalFlip(prob=0.2, cuda=args.cuda),
-            ColorJitter(brightness=0.8, contrast=0.8, saturation=0.2, prob=0.8, cuda=args.cuda)
+            ColorJitter(brightness=0.8 * args.color_jitter_strength,
+                        contrast=0.8 * args.color_jitter_strength,
+                        saturation=0.2 * args.color_jitter_strength,
+                        hue=0.2 * args.color_jitter_strength,
+                        prob=0.8, cuda=args.cuda)
             #  RandomGrayScale(prob=1.0, cuda=args.cuda)  # currently does not work
             # TODO: Gaussian-blur
         ]
@@ -280,7 +286,11 @@ def build_train_and_test_transforms():
             # transforms.CenterCrop(first_center_crop_size),
             transforms.RandomResizedCrop((args.image_size_override, args.image_size_override)),
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomApply([transforms.ColorJitter(0.8, 0.8, 0.2)], p=0.8),
+            transforms.RandomApply([transforms.ColorJitter(
+                brightness=0.8 * args.color_jitter_strength,
+                contrast=0.8 * args.color_jitter_strength,
+                saturation=0.8 * args.color_jitter_strength,
+                hue=0.2 * args.color_jitter_strength)], p=0.8),
             transforms.RandomGrayscale(p=0.2),
             GaussianBlur(kernel_size=int(0.1 * args.image_size_override), p=0.5)
         ]
