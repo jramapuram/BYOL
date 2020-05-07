@@ -41,7 +41,7 @@ class NTXent(nn.Module):
         batch_size = embedding1.shape[0]
         feature_size = embedding1.shape[-1]
         num_replicas = dist.get_world_size() if num_replicas is None else num_replicas
-        infinity = 1e9
+        LARGE_NUM = 1e9
 
         # normalize both embeddings
         embedding1 = l2_normalize(embedding1, dim=-1)
@@ -71,9 +71,9 @@ class NTXent(nn.Module):
 
         # Matmul-to-mask
         logits_aa = torch.matmul(embedding1, embedding1_full.T) / temperature
-        logits_aa = logits_aa - masks * infinity
+        logits_aa = logits_aa - masks * LARGE_NUM
         logits_bb = torch.matmul(embedding2, embedding2_full.T) / temperature
-        logits_bb = logits_bb - masks * infinity
+        logits_bb = logits_bb - masks * LARGE_NUM
         logits_ab = torch.matmul(embedding1, embedding2_full.T) / temperature
         logits_ba = torch.matmul(embedding2, embedding1_full.T) / temperature
 

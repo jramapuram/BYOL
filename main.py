@@ -73,7 +73,7 @@ parser.add_argument('--color-jitter-strength', type=float, default=1.0,
                     help='scalar weighting for the color jitter (default: 1.0)')
 parser.add_argument('--weight-decay', type=float, default=1e-6, help='weight decay (default: 1e-6)')
 parser.add_argument('--polyak-ema', type=float, default=0, help='Polyak weight averaging co-ef (default: 0)')
-parser.add_argument('--convert-to-sync-bn', action='store_true', default=False,#True,
+parser.add_argument('--convert-to-sync-bn', action='store_true', default=False,
                     help='converts all BNs to SyncBNs (default: True)')
 
 # Optimization related
@@ -158,6 +158,7 @@ class SimCLR(nn.Module):
             nn.BatchNorm1d(args.head_latent_size),
             nn.ReLU(),
             nn.Linear(args.head_latent_size, nce_logits_output_size),
+            nn.BatchNorm1d(nce_logits_output_size)
         )
 
         # The linear classifer head which we will stop-grad to
@@ -171,7 +172,8 @@ class SimCLR(nn.Module):
         logits_for_nce2 = self.head(representation2)
 
         # Stop-gradients to the classifier to not learn a trivially better model.
-        linear_preds = self.linear_classifier(representation1.clone().detach())
+        repr_to_classifier = torch.cat([representation1, representation2], 0) if self.training else representation1
+        linear_preds = self.linear_classifier(repr_to_classifier.clone().detach())
         return logits_for_nce1, logits_for_nce2, linear_preds
 
 
@@ -369,6 +371,21 @@ def lazy_generate_modules(model, loader):
     model.eval()
     for augmentation1, augmentation2, labels in loader:
         with torch.no_grad():
+            # Some sanity prints on the minibatch and labels
+            print("augmentation1 = {} / {} | augmentation2 = {} / {} | labels = {} / {}".format(
+                augmentation1.shape, augmentation1.dtype,
+                augmentation2.shape, augmentation2.dtype,
+                labels.shape, labels.dtype))
+            aug1_min, aug1_max = augmentation1.min(), augmentation1.max()
+            aug2_min, aug2_max = augmentation2.min(), augmentation2.max()
+            print("aug1 in range [min: {}, max: {}] | aug2 in range [min: {}, max: {}]".format(
+                aug1_min, aug1_max, aug2_min, aug2_max))
+            if aug1_max > 1.0 or aug1_min < 0:
+                raise ValueError("aug1 max > 1.0 or aug1 min < 0. You probably dont want this.")
+
+            if aug2_max > 1.0 or aug2_min < 0:
+                raise ValueError("aug2 max > 1.0 or aug2 min < 0. You probably dont want this.")
+
             augmentation1 = augmentation1.cuda(non_blocking=True) if args.cuda else augmentation1
             augmentation2 = augmentation2.cuda(non_blocking=True) if args.cuda else augmentation2
             _ = model(augmentation1, augmentation2)
@@ -426,14 +443,18 @@ def register_images(output_map, grapher, prefix='train'):
 
 def _extract_sum_scalars(v1, v2):
     """Simple helper to sum values in a struct using dm_tree."""
-    if not isinstance(v2, (float, np.float32, np.float64)):
-        return v1 + v2.detach()
 
-    return v1 + v2
+    def chk(c):
+        """Helper to check if we have a primitive or tensor"""
+        return not isinstance(c, (int, float, np.int32, np.int64, np.float32, np.float64))
+
+    v1_detached = v1.detach() if chk(v1) else v1
+    v2_detached = v2.detach() if chk(v2) else v2
+    return v1_detached + v2_detached
 
 
 def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
-    """ execute the graph; when 'train' is in the name the model runs the optimizer
+    """ execute the graph; wphen 'train' is in the name the model runs the optimizer
 
     :param epoch: the current epoch number
     :param model: the torch model
@@ -446,7 +467,7 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
 
     """
     start_time = time.time()
-    is_eval = prefix != 'train'
+    is_eval = 'train' not in prefix
     model.eval() if is_eval else model.train()
     assert optimizer is None if is_eval else optimizer is not None
     loss_map, num_samples = {}, 0
@@ -460,7 +481,7 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
         augmentation2 = augmentation2.cuda(non_blocking=True) if args.cuda else augmentation2
         labels = labels.cuda(non_blocking=True) if args.cuda else labels
 
-        with torch.no_grad() if prefix == 'test' else utils.dummy_context():
+        with torch.no_grad() if is_eval else utils.dummy_context():
             if is_eval and args.polyak_ema > 0:                                  # use the Polyak model for predictions
                 nce_logits1, nce_logits2, linear_preds = layers.get_polyak_prediction(
                     model, pred_fn=functools.partial(model, augmentation1, augmentation2))
@@ -469,11 +490,13 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
                                                                augmentation2)    # get normal predictions
 
             # The loss is the NCE loss + classifer loss (with stop-grad of course).
-            acc1, acc5 = metrics.topk(output=linear_preds, target=labels, topk=(1, 5))
             nce_loss = objective(nce_logits1, nce_logits2,
                                  temperature=args.nce_temperature,
                                  num_replicas=args.num_replicas)
-            classifier_loss = F.cross_entropy(input=linear_preds, target=labels)
+            classifier_labels = labels if is_eval else torch.cat([labels, labels], 0)
+            classifier_loss = F.cross_entropy(input=linear_preds, target=classifier_labels)
+            acc1, acc5 = metrics.topk(output=linear_preds, target=classifier_labels, topk=(1, 5))
+
             loss_t = {
                 'loss_mean': nce_loss + classifier_loss,
                 'nce_loss_mean': nce_loss,
@@ -522,9 +545,13 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     # plot the test accuracy, loss and images
     register_plots({**loss_map}, grapher, epoch=epoch, prefix=prefix)
 
-    # tack on images to grapher, making them smaller to not waste network bandwidth
-    image_map = {'augmentation1_imgs': F.interpolate(augmentation1, size=(64, 64)),
-                 'augmentation2_imgs': F.interpolate(augmentation2, size=(64, 64))}
+    # tack on images to grapher, making them smaller and only use 64 to not waste network bandwidth
+    num_images_to_post = min(64, augmentation1.shape[0])
+    image_size_to_post = min(64, augmentation1.shape[-1])
+    image_map = {'augmentation1_imgs': F.interpolate(augmentation1[0:num_images_to_post],
+                                                     size=(image_size_to_post, image_size_to_post)),
+                 'augmentation2_imgs': F.interpolate(augmentation2[0:num_images_to_post],
+                                                     size=(image_size_to_post, image_size_to_post))}
     register_images({**image_map}, grapher, prefix=prefix)
     if grapher is not None:
         grapher.save()
