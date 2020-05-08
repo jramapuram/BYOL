@@ -56,6 +56,11 @@ If training doesn't work well try chaning the [AMP optimization](https://nvidia.
 
 Try increasing `--workers-per-replica` for dataloading or placing your dataset on a drive with larger IOPS.  
 Optionally, you can also try to use the [Nvidia DALI](https://github.com/NVIDIA/DALI) image loading backend by specifying `--task=dali_multi_augment_image_folder`. However, the latter is missing the grayscale and gaussian blur augmentations, so model  performance might be degraded.
+
+## Visualize results
+
+This implementation supports tensorboard and visdom.  
+Omitting the `--visdom-url` and `--visdom-port` args defaults to tensorboard (which stores in `./runs`).
   
 ## Citation
 
