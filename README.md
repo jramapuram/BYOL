@@ -44,7 +44,7 @@ Setup stuff according to the [slurm bash script](./slurm/run.sh). Then:
 
 ## Setup data
 
-Grab imagenet, [do standard pre-processing](https://github.com/soumith/imagenet-multiGPU.torch#data-processing) and use `--data-dir=${DATA_DIR}`. **Note:** This SimCLR implementation expectes two pytorch `imagefolder` locations: `train` and `test` as opposed to `val` in the preprocessor above.
+Grab imagenet, [do standard pre-processing](https://github.com/soumith/imagenet-multiGPU.torch#data-processing) and use `--data-dir=${DATA_DIR}`. **Note:** This SimCLR implementation expects two pytorch `imagefolder` locations: `train` and `test` as opposed to `val` in the preprocessor above.
 
 ## FP16 support
 
