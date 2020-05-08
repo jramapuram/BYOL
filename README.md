@@ -1,7 +1,7 @@
 # SimCLR-pytorch
 
 An implementation of [SimCLR](https://arxiv.org/abs/2002.05709) with DistributedDataParallel (1GPU : 1Process) in pytorch.  
-This allows scalability to batch size of 4096 (suggested by authors) using 64 gpus, each with batch size of 64.
+This allows scalability to batch size of 4096 (suggested by authors) using 64 gpus, each with batch size of 64 at a resolution of 224x224x3 in FP32 (see below for FP16 support).
 
 
 ## Usage Single GPU
@@ -38,7 +38,7 @@ Setup stuff according to the [slurm bash script](./slurm/run.sh). Then:
 
   1. Start each replica worker pointing to the master using `--distributed-master=`.
   2. Set the total number of replicas appropriately using `--num-replicas=`.
-  3. Set each node to have a unique `--distributed-rank=` ranging from `[0, num_replicas]`.
+  3. Set each node to have a unique `--distributed-rank=` ranging from `[0, num_replicas)`.
   3. Ensure network connectivity between workers. You will get NCCL errors if there are resolution problems here.
   4. Profit.
 
@@ -48,14 +48,14 @@ Grab imagenet, [do standard pre-processing](https://github.com/soumith/imagenet-
 
 ## FP16 support
 
-If you have GPUs that work well with FP16 you can try the `--half` flag.  
-This will allow faster training with larger batch sizes (~100 w/12Gb GPU memory).  
+If you have GPUs that works well with FP16, you can try the `--half` flag.  
+This will allow faster training with larger batch sizes (~95 with a 12Gb GPU memory).  
 If training doesn't work well try chaning the [AMP optimization](https://nvidia.github.io/apex/amp.html#opt-levels) level [here](https://github.com/jramapuram/SimCLR/blob/master/main.py#L590).
 
 ## IO bound / Slow data processing?
 
 Try increasing `--workers-per-replica` for dataloading or placing your dataset on a drive with larger IOPS.  
-Optionally, you can also try to use the [Nvidia DALI](https://github.com/NVIDIA/DALI) image loading backend by specifying `--task=dali_multi_augment_image_folder`. 
+Optionally, you can also try to use the [Nvidia DALI](https://github.com/NVIDIA/DALI) image loading backend by specifying `--task=dali_multi_augment_image_folder`. However, the latter is missing the grayscale and gaussian blur augmentations, so model  performance might be degraded.
   
 ## Citation
 
