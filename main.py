@@ -258,7 +258,7 @@ def build_train_and_test_transforms():
         # Lazy import DALI dependencies because debug cpu nodes might not have DALI.
         import nvidia.dali.ops as ops
         import nvidia.dali.types as types
-        from datasets.dali_imagefolder import ColorJitter, RandomHorizontalFlip
+        from datasets.dali_imagefolder import ColorJitter, RandomHorizontalFlip, RandomGrayScale
 
         train_transform = [
             ops.RandomResizedCrop(device="gpu" if args.cuda else "cpu",
@@ -270,8 +270,8 @@ def build_train_and_test_transforms():
                         contrast=0.8 * args.color_jitter_strength,
                         saturation=0.2 * args.color_jitter_strength,
                         hue=0.2 * args.color_jitter_strength,
-                        prob=0.8, cuda=args.cuda)
-            #  RandomGrayScale(prob=1.0, cuda=args.cuda)  # currently does not work
+                        prob=0.8, cuda=args.cuda),
+            RandomGrayScale(prob=0.2, cuda=args.cuda)
             # TODO: Gaussian-blur
         ]
         test_transform = [
