@@ -41,6 +41,41 @@ Setup stuff according to the [slurm bash script](./slurm/run.sh). Then:
   3. Set each node to have a unique `--distributed-rank=` ranging from `[0, num_replicas)`.
   3. Ensure network connectivity between workers. You will get NCCL errors if there are resolution problems here.
   4. Profit.
+  
+For example, with a 2 node setup run the following on the master node:
+```bash
+python main.py \
+     --epochs=100 \
+     --data-dir=<YOUR_DATA_DIR> \
+     --batch-size=128 \                   # divides into 64 per node
+     --convert-to-sync-bn \
+     --visdom-url=http://MY_VISDOM_URL \  # optional, not providing uses tensorboard
+     --visdom-port=8097 \                 # optional, not providing uses tensorboard
+     --num-replicas=2 \                   # specifies total available nodes, 2 in this example     
+     --distributed-master=127.0.0.1 \
+     --distributed-port=29301 \
+     --distributed-rank=0 \               # rank-0 is the master
+     --uid=simclrv00_0
+```
+
+and the following on the child node:
+
+```bash
+export MASTER=<IP_ADDR_OF_MASTER_ABOVE>
+python main.py \
+     --epochs=100 \
+     --data-dir=<YOUR_DATA_DIR> \
+     --batch-size=128 \                   # divides into 64 per node
+     --convert-to-sync-bn \
+     --visdom-url=http://MY_VISDOM_URL \  # optional, not providing uses tensorboard
+     --visdom-port=8097 \                 # optional, not providing uses tensorboard
+     --num-replicas=2 \                   # specifies total available nodes, 2 in this example
+     --distributed-master=$MASTER \
+     --distributed-port=29301 \
+     --distributed-rank=1 \               # rank-1 is this child, increment for extra nodes
+     --uid=simclrv00_0
+```
+
 
 ## Setup data
 
