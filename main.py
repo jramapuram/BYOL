@@ -146,7 +146,6 @@ class SimCLR(nn.Module):
         """
         super(SimCLR, self).__init__()
         self.base_network_output_size = base_network_output_size
-        self.polyak_ema = layers.EMA(args.polyak_ema) if args.polyak_ema > 0 else None
 
         # The base network and the head network used for the self-supervised objective
         model_fn = models.__dict__[args.arch]
@@ -392,7 +391,7 @@ def lazy_generate_modules(model, loader):
             break
 
     # initialize the polyak-ema op if it exists
-    if hasattr(model, 'polyak_ema') and args.polyak_ema > 0:
+    if args.polyak_ema > 0:
         layers.polyak_ema_parameters(model, args.polyak_ema)
 
 
