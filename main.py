@@ -12,11 +12,10 @@ import torch.nn.functional as F
 import torch.multiprocessing as mp
 import numpy as np
 
-
 from torchvision import transforms
 import torchvision.models as models
 
-from objective import NTXent
+from objective import loss_function
 import helpers.metrics as metrics
 import helpers.layers as layers
 import helpers.utils as utils
@@ -33,7 +32,7 @@ model_names = sorted(name for name in models.__dict__
                      and callable(models.__dict__[name]))
 
 
-parser = argparse.ArgumentParser(description='SimCLR Pytorch')
+parser = argparse.ArgumentParser(description='BYOL Pytorch')
 
 # Task parameters
 parser.add_argument('--task', type=str, default="multi_augment_image_folder",
@@ -57,12 +56,12 @@ parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50', choices=
                     help='model architecture: ' + ' | '.join(model_names) + ' (default: resnet18)')
 parser.add_argument('--representation-size', type=int, default=2048,
                     help='size of the representation (eg: final AvgPool for resnet) (default: 2048)')
-parser.add_argument('--nce-size', type=int, default=128,
-                    help='size for NCE loss computation [output of head] (default: 128)')
-parser.add_argument('--head-latent-size', type=int, default=1024,
-                    help='size for hidden layer for the MLP projection head (default: 1024)')
-parser.add_argument('--nce-temperature', type=float, default=0.1,
-                    help='temp for NCE loss (default: 0.1)')
+parser.add_argument('--projection-size', type=int, default=256,
+                    help='output size for projection head (default: 256)')
+parser.add_argument('--head-latent-size', type=int, default=4096,
+                    help='size for hidden layer for the MLP projection head (default: 4096)')
+parser.add_argument('--base-decay', type=float, default=0.996,
+                    help='decay for target network (default: 0.996)')
 parser.add_argument('--weight-initialization', type=str, default=None,
                     help='weight initialization type; None uses default pytorch init. (default: None)')
 parser.add_argument('--model-dir', type=str, default='.models',
@@ -71,7 +70,7 @@ parser.add_argument('--model-dir', type=str, default='.models',
 # Regularizer
 parser.add_argument('--color-jitter-strength', type=float, default=1.0,
                     help='scalar weighting for the color jitter (default: 1.0)')
-parser.add_argument('--weight-decay', type=float, default=1e-6, help='weight decay (default: 1e-6)')
+parser.add_argument('--weight-decay', type=float, default=1e-6, help='weight decay (default: 1.5e-6)')
 parser.add_argument('--polyak-ema', type=float, default=0, help='Polyak weight averaging co-ef (default: 0)')
 parser.add_argument('--convert-to-sync-bn', action='store_true', default=False,
                     help='converts all BNs to SyncBNs (default: True)')
@@ -79,8 +78,8 @@ parser.add_argument('--convert-to-sync-bn', action='store_true', default=False,
 # Optimization related
 parser.add_argument('--clip', type=float, default=0,
                     help='gradient clipping value (default: 0)')
-parser.add_argument('--lr', type=float, default=0.3, metavar='LR',
-                    help='learning rate (default: 0.3)')
+parser.add_argument('--lr', type=float, default=0.2, metavar='LR',
+                    help='learning rate (default: 0.2)')
 parser.add_argument('--lr-update-schedule', type=str, default='cosine',
                     help='learning rate schedule fixed/step/cosine (default: cosine)')
 parser.add_argument('--warmup', type=int, default=10, help='warmup epochs (default: 10)')
@@ -129,25 +128,63 @@ if aws_instance_id is not None:
     args.instance_id = aws_instance_id
 
 
-class SimCLR(nn.Module):
-    """Simple SIMCLR implementation."""
+class CosEMA(nn.Module):
+    def __init__(self, total_steps, base_decay=0.996):
+        """Exponential moving average used in BYOL.
 
-    def __init__(self, base_network_output_size,
-                 nce_logits_output_size,
-                 classifier_output_size):
-        """SimCLR model.
-
-        :param base_network_output_size: output-size of resnet50 embedding
-        :param nce_logits_output_size: output-size to use for NCE loss
-        :param classifier_output_size: number of classes in classifier problem
-        :returns: SimCLR object
+        :param base_decay: the base ema decay used to modulate
+        :returns: EMA module
         :rtype: nn.Module
 
         """
-        super(SimCLR, self).__init__()
+        super(CosEMA, self).__init__()
+        self.step = 0
+        self.total_steps = total_steps
+        self.base_decay = base_decay
+        self.register_buffer('mean', None)  # running mean
+
+    def forward(self, x):
+        """Takes an input and updates internal running mean.
+
+        :param x: input tensor
+        :returns: same input tensor itself [tracks internally]
+        :rtype: torch.Tensor
+
+        """
+        if self.mean is None:
+            self.mean = torch.zeros_like(x)
+
+        if self.training:  # only update the values if we are in a training state.
+            decay = 1 - (1 - self.base_decay) * (np.cos(np.pi * self.step / self.total_steps) + 1) / 2.0
+            self.mean = (1 - decay) * x.detach() + decay * self.mean
+            self.step += 1
+
+        return x
+
+
+class BYOL(nn.Module):
+    """Simple BYOL implementation."""
+
+    def __init__(self, base_network_output_size,
+                 projection_output_size,
+                 classifier_output_size,
+                 total_training_steps,
+                 base_decay=0.996):
+        """BYOL model.
+
+        :param base_network_output_size: output-size of resnet50 embedding
+        :param projection_output_size: output size of projection and prediction heads
+        :param classifier_output_size: number of classes in classifier problem
+        :param total_training_steps: total steps for a single training epoch
+        :param base_decay: the decay for the target network
+        :returns: BYOL object
+        :rtype: nn.Module
+
+        """
+        super(BYOL, self).__init__()
         self.base_network_output_size = base_network_output_size
 
-        # The base network and the head network used for the self-supervised objective
+        # The base network, head network and predictor used for the self-supervised objective
         model_fn = models.__dict__[args.arch]
         self.base_network = nn.Sequential(
             *list(model_fn(pretrained=False).children())[:-1]  # No dense projection
@@ -156,24 +193,85 @@ class SimCLR(nn.Module):
             nn.Linear(base_network_output_size, args.head_latent_size),
             nn.BatchNorm1d(args.head_latent_size),
             nn.ReLU(),
-            nn.Linear(args.head_latent_size, nce_logits_output_size),
-            nn.BatchNorm1d(nce_logits_output_size)
+            nn.Linear(args.head_latent_size, projection_output_size),
+        )
+        self.predictor = nn.Sequential(
+            nn.Linear(projection_output_size, args.head_latent_size),
+            nn.BatchNorm1d(args.head_latent_size),
+            nn.ReLU(),
+            nn.Linear(args.head_latent_size, projection_output_size),
         )
 
         # The linear classifer head which we will stop-grad to
         self.linear_classifier = nn.Linear(base_network_output_size, classifier_output_size)
 
+        # Initialize the target network.
+        self.target_network = CosEMA(total_training_steps, base_decay)
+        self.target_network(nn.utils.parameters_to_vector(self.parameters()))
+
+    def target_prediction(self, augmentation2):
+        """Produce a prediction using the target network.
+
+        :param augmentation2: the second augmentation
+        :returns: the same outputs as prediction
+        :rtype: torch.Tensor, torch.Tensor, torch.Tensor
+
+        """
+        mean = self.target_network.mean
+        original_params = nn.utils.parameters_to_vector(self.parameters())
+        nn.utils.vector_to_parameters(mean, self.parameters())
+        preds = self.prediction(augmentation2)
+        nn.utils.vector_to_parameters(original_params, self.parameters())
+        return preds
+
+    def prediction(self, augmentation):
+        """Simple helper to project a single augmentation
+
+        :param augmentation: a single data augmentation
+        :returns: representation, projection and prediction
+        :rtype: torch.Tensor, torch.Tensor, torch.Tensor
+
+        """
+        representation = self.base_network(augmentation).view(-1, self.base_network_output_size)
+        projection = self.head(representation)
+        prediction = self.predictor(projection)
+        return representation, projection, prediction
+
     def forward(self, augmentation1, augmentation2):
-        """Returns the NCE logits and the linear predictions."""
-        representation1 = self.base_network(augmentation1).view(-1, self.base_network_output_size)
-        representation2 = self.base_network(augmentation2).view(-1, self.base_network_output_size)
-        logits_for_nce1 = self.head(representation1)
-        logits_for_nce2 = self.head(representation2)
+        """Returns the online and target network representations, projections and predictions."""
+        online_representation1, online_projection1, online_prediction1 = self.prediction(augmentation1)
+        online_representation2, online_projection2, online_prediction2 = self.prediction(augmentation2)
+        target_representation1, target_projection1, target_prediction1 = self.target_prediction(augmentation1)
+        target_representation2, target_projection2, target_prediction2 = self.target_prediction(augmentation2)
 
         # Stop-gradients to the classifier to not learn a trivially better model.
-        repr_to_classifier = torch.cat([representation1, representation2], 0) if self.training else representation1
+        repr_to_classifier = torch.cat([online_representation1, online_representation2], 0) \
+            if self.training else online_representation1
         linear_preds = self.linear_classifier(repr_to_classifier.clone().detach())
-        return logits_for_nce1, logits_for_nce2, linear_preds
+
+        # Update the EMA parameters and return the predictions
+        self.target_network(nn.utils.parameters_to_vector(self.parameters()))
+
+        # Return all the predictions and classifier outputs
+        return {
+            'linear_preds': linear_preds,
+            # Online model on augmentation 1
+            'online_representation1': online_representation1,
+            'online_projection1': online_projection1,
+            'online_prediction1': online_prediction1,
+            # Online model on augmentation 2
+            'online_representation2': online_representation2,
+            'online_projection2': online_projection2,
+            'online_prediction2': online_prediction2,
+            # Target model on augmentation 1
+            'target_representation1': target_representation1,
+            'target_projection1': target_projection1,
+            'target_prediction1': target_prediction1,
+            # Target model on augmentation 2
+            'target_representation2': target_representation2,
+            'target_projection2': target_projection2,
+            'target_prediction2': target_prediction2,
+        }
 
 
 def build_lr_schedule(optimizer, last_epoch=-1):
@@ -231,7 +329,7 @@ def build_optimizer(model, last_epoch=-1):
     # Build the base optimizer
     lr = args.lr
     if opt_name in ["momentum", "sgd"]:
-        lr = args.lr * (args.batch_size * args.num_replicas / 256)  # Following SimCLR
+        lr = args.lr * (args.batch_size * args.num_replicas / 256)  # Following BYOL/SimCLR
 
     opt = optim_map[opt_name](params_to_optimize, lr=lr)
 
@@ -325,9 +423,11 @@ def build_loader_model_grapher(args):
     args.total_train_steps = args.epochs * args.steps_per_train_epoch
 
     # build the network
-    network = SimCLR(base_network_output_size=args.representation_size,
-                     nce_logits_output_size=args.nce_size,
-                     classifier_output_size=loader.output_size)
+    network = BYOL(base_network_output_size=args.representation_size,
+                   projection_output_size=args.projection_size,
+                   classifier_output_size=loader.output_size,
+                   total_training_steps=args.total_train_steps,
+                   base_decay=args.base_decay)
     network = nn.SyncBatchNorm.convert_sync_batchnorm(network) if args.convert_to_sync_bn else network
     network = network.cuda() if args.cuda else network
     lazy_generate_modules(network, loader.train_loader)
@@ -471,9 +571,6 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     assert optimizer is None if is_eval else optimizer is not None
     loss_map, num_samples = {}, 0
 
-    # the NT-Xent loss from SimCLR
-    objective = NTXent()
-
     # iterate over data and labels
     for num_minibatches, (augmentation1, augmentation2, labels) in enumerate(loader):
         augmentation1 = augmentation1.cuda(non_blocking=True) if args.cuda else augmentation1
@@ -482,23 +579,23 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
 
         with torch.no_grad() if is_eval else utils.dummy_context():
             if is_eval and args.polyak_ema > 0:                                  # use the Polyak model for predictions
-                nce_logits1, nce_logits2, linear_preds = layers.get_polyak_prediction(
+                output_dict = layers.get_polyak_prediction(
                     model, pred_fn=functools.partial(model, augmentation1, augmentation2))
             else:
-                nce_logits1, nce_logits2, linear_preds = model(augmentation1,
-                                                               augmentation2)    # get normal predictions
+                output_dict = model(augmentation1, augmentation2)                # get normal predictions
 
-            # The loss is the NCE loss + classifer loss (with stop-grad of course).
-            nce_loss = objective(nce_logits1, nce_logits2,
-                                 temperature=args.nce_temperature,
-                                 num_replicas=args.num_replicas)
+            # The loss is the BYOL loss + classifer loss (with stop-grad of course).
+            byol_loss = loss_function(online_prediction1=output_dict['online_prediction1'],
+                                      online_prediction2=output_dict['online_prediction2'],
+                                      target_projection1=output_dict['target_projection1'],
+                                      target_projection2=output_dict['target_projection2'])
             classifier_labels = labels if is_eval else torch.cat([labels, labels], 0)
-            classifier_loss = F.cross_entropy(input=linear_preds, target=classifier_labels)
-            acc1, acc5 = metrics.topk(output=linear_preds, target=classifier_labels, topk=(1, 5))
+            classifier_loss = F.cross_entropy(input=output_dict['linear_preds'], target=classifier_labels)
+            acc1, acc5 = metrics.topk(output=output_dict['linear_preds'], target=classifier_labels, topk=(1, 5))
 
             loss_t = {
-                'loss_mean': nce_loss + classifier_loss,
-                'nce_loss_mean': nce_loss,
+                'loss_mean': byol_loss + classifier_loss,
+                'byol_loss_mean': byol_loss,
                 'linear_loss_mean': classifier_loss,
                 'top1_mean': acc1,
                 'top5_mean': acc5,
