@@ -1,7 +1,7 @@
-# SimCLR-pytorch
+# BYOL-pytorch
 
-An implementation of [SimCLR](https://arxiv.org/abs/2002.05709) with DistributedDataParallel (1GPU : 1Process) in pytorch.  
-This allows scalability to batch size of 4096 (suggested by authors) using 64 gpus, each with batch size of 64 at a resolution of 224x224x3 in FP32 (see below for FP16 support).
+An implementation of [BYOL](https://arxiv.org/abs/2006.07733) with DistributedDataParallel (1GPU : 1Process) in pytorch.  
+This allows scalability to any batch size; as an example a batch size of 4096 is possible using 64 gpus, each with batch size of 64 at a resolution of 224x224x3 in FP32 (see below for FP16 support).
 
 
 ## Usage Single GPU
@@ -11,7 +11,7 @@ This allows scalability to batch size of 4096 (suggested by authors) using 64 gp
 
 
 ``` bash
-> git clone --recursive git+ssh://git@github.com/jramapuram/SimCLR.git
+> git clone --recursive git+ssh://git@github.com/jramapuram/BYOL.git
 # DATADIR is the location of imagenet or anything that works with imagefolder.
 > ./docker/run.sh "python main.py --data-dir=$DATADIR \  
                                   --batch-size=64 \  
@@ -55,7 +55,7 @@ python main.py \
      --distributed-master=127.0.0.1 \
      --distributed-port=29301 \
      --distributed-rank=0 \               # rank-0 is the master
-     --uid=simclrv00_0
+     --uid=byolv00_0
 ```
 
 and the following on the child node:
@@ -73,7 +73,7 @@ python main.py \
      --distributed-master=$MASTER \
      --distributed-port=29301 \
      --distributed-rank=1 \               # rank-1 is this child, increment for extra nodes
-     --uid=simclrv00_0
+     --uid=byolv00_0
 ```
 
 
@@ -102,11 +102,31 @@ Omitting the `--visdom-url` and `--visdom-port` args defaults to tensorboard (wh
 Cite the original authors on doing some great work:
 
 ```
-@article{chen2020simple,
-  title={A Simple Framework for Contrastive Learning of Visual Representations},
-  author={Chen, Ting and Kornblith, Simon and Norouzi, Mohammad and Hinton, Geoffrey},
-  journal={arXiv preprint arXiv:2002.05709},
-  year={2020}
+@article{DBLP:journals/corr/abs-2006-07733,
+  author    = {Jean{-}Bastien Grill and
+               Florian Strub and
+               Florent Altch{\'{e}} and
+               Corentin Tallec and
+               Pierre H. Richemond and
+               Elena Buchatskaya and
+               Carl Doersch and
+               Bernardo {\'{A}}vila Pires and
+               Zhaohan Daniel Guo and
+               Mohammad Gheshlaghi Azar and
+               Bilal Piot and
+               Koray Kavukcuoglu and
+               R{\'{e}}mi Munos and
+               Michal Valko},
+  title     = {Bootstrap Your Own Latent: {A} New Approach to Self-Supervised Learning},
+  journal   = {CoRR},
+  volume    = {abs/2006.07733},
+  year      = {2020},
+  url       = {https://arxiv.org/abs/2006.07733},
+  archivePrefix = {arXiv},
+  eprint    = {2006.07733},
+  timestamp = {Wed, 17 Jun 2020 14:28:54 +0200},
+  biburl    = {https://dblp.org/rec/journals/corr/abs-2006-07733.bib},
+  bibsource = {dblp computer science bibliography, https://dblp.org}
 }
 ```
 
