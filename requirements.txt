@@ -77,7 +77,7 @@ torchvision==0.6.0a0+82fd1c8
 tornado==6.0.4
 tqdm==4.45.0
 traitlets==4.3.3
-urllib3==1.25.9
+urllib3==1.26.5
 visdom==0.1.8.9
 wcwidth==0.1.9
 websocket-client==0.57.0
